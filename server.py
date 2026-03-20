@@ -857,29 +857,31 @@ async def ws_handler(websocket):
                 elif data.get('action') == 'get_klines':
                     code = data.get('code', '')
                     days = min(int(data.get('days', 60)), 150)
-                    # 优先从缓存取，缓存没有再从通达信取
+                    # 优先从缓存取，缓存没有再从通达信取（线程池）
                     klines = klines_cache.get(code, [])
                     if klines:
                         klines = klines[-days:]
                     else:
-                        klines = fetch_stock_klines(code, days)
+                        klines = await asyncio.to_thread(fetch_stock_klines, code, days)
                     await websocket.send(json.dumps({
                         'type': 'klines',
                         'data': klines
                     }))
                     print(f"[K线] {code} {days}日 → {len(klines)}条")
                 elif data.get('action') == 'get_sentiment':
-                    sentiment = gen_sentiment_data()
+                    sentiment = await asyncio.to_thread(gen_sentiment_data)
                     await websocket.send(json.dumps({
                         'type': 'sentiment',
                         'data': sentiment
                     }))
                 elif data.get('action') == 'update_schemes':
-                    # 收到方案后立即执行选股
+                    # 收到方案后立即执行选股（阻塞调用放线程池）
                     schemes = data.get('schemes', [])
-                    refresh_klines_cache_if_needed()
-                    quotes = fetch_realtime_quotes() or {}
-                    screen_results = screen_stocks_by_schemes(schemes, quotes)
+                    def _do_screen():
+                        refresh_klines_cache_if_needed()
+                        quotes = fetch_realtime_quotes() or {}
+                        return screen_stocks_by_schemes(schemes, quotes)
+                    screen_results = await asyncio.to_thread(_do_screen)
                     await websocket.send(json.dumps({
                         'type': 'screen_results',
                         'alerts': screen_results
@@ -887,9 +889,11 @@ async def ws_handler(websocket):
                     print(f"[选股] 方案选股完成，命中 {len(screen_results)} 只")
                 elif data.get('action') == 'screen_stocks':
                     schemes = data.get('schemes', [])
-                    refresh_klines_cache_if_needed()
-                    quotes = fetch_realtime_quotes() or {}
-                    screen_results = screen_stocks_by_schemes(schemes, quotes)
+                    def _do_screen2():
+                        refresh_klines_cache_if_needed()
+                        quotes = fetch_realtime_quotes() or {}
+                        return screen_stocks_by_schemes(schemes, quotes)
+                    screen_results = await asyncio.to_thread(_do_screen2)
                     await websocket.send(json.dumps({
                         'type': 'screen_results',
                         'alerts': screen_results
@@ -914,8 +918,8 @@ async def scan_loop():
     global all_alerts
     print("[扫描] 启动实时扫描循环")
 
-    # 启动时先连接通达信
-    get_tdx()
+    # 启动时先连接通达信（放线程池，不阻塞事件循环）
+    await asyncio.to_thread(get_tdx)
 
     _prev_state = ''
     _kline_update_count = 0
@@ -926,7 +930,7 @@ async def scan_loop():
 
             # 盘中扫描
             if state in ('open', 'call'):
-                quotes = fetch_realtime_quotes()
+                quotes = await asyncio.to_thread(fetch_realtime_quotes)
                 if quotes:
                     # ① 检测异动
                     new_alerts = detect_alerts(quotes)
@@ -951,7 +955,7 @@ async def scan_loop():
             # 刚从盘中切换到收盘 → 保存数据
             elif _prev_state in ('open',) and state == 'closed':
                 print("[扫描] 检测到收盘，保存K线数据...")
-                on_market_close()
+                await asyncio.to_thread(on_market_close)
 
             else:
                 # 非盘中：每30秒检查一次状态
@@ -969,56 +973,58 @@ async def main():
     server = await websockets.serve(ws_handler, "0.0.0.0", WS_PORT)
     print(f"[StockRadar] ws://0.0.0.0:{WS_PORT} (mootdx 真实行情)")
 
-    # 启动时优先从本地JSON文件加载K线（毫秒级启动）
+    # 启动时优先从本地JSON文件加载K线（毫秒级，不阻塞）
     print("[启动] 尝试从本地文件加载K线缓存...")
     loaded = load_klines_from_file()
     if loaded:
         print(f"[启动] 本地缓存已加载，{len(klines_cache)} 只股票可用")
     else:
-        print("[启动] 本地无缓存，尝试从通达信下载...")
-        try:
-            preload_all_klines(150)
-        except Exception as e:
-            print(f"[启动] 通达信下载失败（可能网络不通）: {e}")
+        print("[启动] 本地无缓存，后台尝试从通达信下载...")
 
-    # 后台尝试补充最新数据（不阻塞WS服务）
+    # 后台尝试补充最新数据（全部放线程池，不阻塞WS服务和事件循环）
     async def background_update():
-        await asyncio.sleep(5)  # 等5秒再尝试
-        try:
-            client = get_tdx()
-            if client:
-                updated_count = 0
-                for code, name in STOCKS:
-                    try:
-                        df = client.bars(symbol=code, frequency=9, offset=5)
-                        if df is not None and not df.empty:
-                            existing = klines_cache.get(code, [])
-                            existing_dates = {k['date'] for k in existing}
-                            for _, row in df.iterrows():
-                                dt = str(row.get('datetime', ''))[:10]
-                                if dt not in existing_dates:
-                                    existing.append({
-                                        'date': dt,
-                                        'open': round(float(row.get('open', 0)), 2),
-                                        'close': round(float(row.get('close', 0)), 2),
-                                        'high': round(float(row.get('high', 0)), 2),
-                                        'low': round(float(row.get('low', 0)), 2),
-                                        'volume': float(row.get('vol', 0)),
-                                        'amount': float(row.get('amount', 0)),
-                                    })
-                            existing.sort(key=lambda k: k['date'])
-                            klines_cache[code] = existing[-150:]
-                            updated_count += 1
-                    except Exception as e:
-                        pass
-                if updated_count:
-                    print(f"[补充] 完成，补充了 {updated_count} 只股票的最新K线")
-                    trim_klines_to_150()
-                    save_klines_to_file()
-            else:
-                print("[补充] 通达信不可用，使用本地缓存数据")
-        except Exception as e:
-            print(f"[补充] 补充K线失败: {e}")
+        await asyncio.sleep(3)  # 等3秒再尝试，让WS先稳定
+        def _sync_update():
+            try:
+                if not klines_cache:
+                    print("[补充] 缓存为空，尝试从通达信全量下载...")
+                    preload_all_klines(150)
+                    return
+                client = get_tdx()
+                if client:
+                    updated_count = 0
+                    for code, name in STOCKS:
+                        try:
+                            df = client.bars(symbol=code, frequency=9, offset=5)
+                            if df is not None and not df.empty:
+                                existing = klines_cache.get(code, [])
+                                existing_dates = {k['date'] for k in existing}
+                                for _, row in df.iterrows():
+                                    dt = str(row.get('datetime', ''))[:10]
+                                    if dt not in existing_dates:
+                                        existing.append({
+                                            'date': dt,
+                                            'open': round(float(row.get('open', 0)), 2),
+                                            'close': round(float(row.get('close', 0)), 2),
+                                            'high': round(float(row.get('high', 0)), 2),
+                                            'low': round(float(row.get('low', 0)), 2),
+                                            'volume': float(row.get('vol', 0)),
+                                            'amount': float(row.get('amount', 0)),
+                                        })
+                                existing.sort(key=lambda k: k['date'])
+                                klines_cache[code] = existing[-150:]
+                                updated_count += 1
+                        except Exception as e:
+                            pass
+                    if updated_count:
+                        print(f"[补充] 完成，补充了 {updated_count} 只股票的最新K线")
+                        trim_klines_to_150()
+                        save_klines_to_file()
+                else:
+                    print("[补充] 通达信不可用，使用本地缓存数据")
+            except Exception as e:
+                print(f"[补充] 补充K线失败: {e}")
+        await asyncio.to_thread(_sync_update)
 
     asyncio.create_task(background_update())
     await scan_loop()
