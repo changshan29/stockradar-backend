@@ -1,5 +1,5 @@
 """
-StockRadar 演示引擎 - Railway 部署版
+StockRadar 演示引擎 - Railway 部署版（含情绪数据）
 """
 
 import asyncio
@@ -8,6 +8,9 @@ import time
 import random
 import websockets
 import os
+import urllib.request
+import urllib.error
+from datetime import datetime
 
 # Railway 会提供 PORT 环境变量
 WS_PORT = int(os.environ.get('PORT', 8080))
@@ -85,6 +88,180 @@ NEWS_POOL = [
     None, None, None, None,
 ]
 
+# ── 情绪数据：题材板块 ──
+SECTOR_NAMES = [
+    '人工智能', 'AI芯片', '算力', '光模块', 'CPO', '机器人',
+    '低空经济', '新能源车', '锂电池', '光伏', '储能',
+    '半导体设备', '国产替代', '信创', '鸿蒙', '华为概念',
+    '数据要素', '数字经济', '网络安全', '金融科技',
+    '消费电子', 'MR/VR', '苹果产业链', '军工',
+    '医药', '白酒', '银行', '券商', '保险', '房地产',
+]
+
+def fetch_eastmoney_indices():
+    """从东方财富获取沪深指数实时数据"""
+    try:
+        url = 'https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3&secids=1.000001,0.399001,1.000300'
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://quote.eastmoney.com/'
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            diff = data.get('data', {}).get('diff', [])
+            indices = []
+            for item in diff:
+                indices.append({
+                    'name': item.get('f14', ''),
+                    'price': item.get('f2', 0),
+                    'change': item.get('f3', 0),
+                })
+            return indices
+    except Exception as e:
+        print(f"[情绪] 获取指数失败: {e}")
+        return None
+
+def fetch_eastmoney_breadth():
+    """从东方财富获取涨跌家数（市场宽度）"""
+    try:
+        url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f3'
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://quote.eastmoney.com/'
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            total = data.get('data', {}).get('total', 0)
+            return total
+    except Exception as e:
+        print(f"[情绪] 获取宽度失败: {e}")
+        return None
+
+def fetch_stock_klines(code, days=60):
+    """从东方财富获取个股日K线数据"""
+    try:
+        market = '1' if code.startswith('6') or code.startswith('9') else '0'
+        secid = f"{market}.{code}"
+        url = (f'https://push2his.eastmoney.com/api/qt/stock/kline/get?'
+               f'secid={secid}&fields1=f1,f2,f3,f4,f5,f6'
+               f'&fields2=f51,f52,f53,f54,f55,f56,f57'
+               f'&klt=101&fqt=1&lmt={days}&end=20500101&_={int(time.time()*1000)}')
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://quote.eastmoney.com/'
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+            kline_strs = data.get('data', {}).get('klines', [])
+            result = []
+            for ks in kline_strs:
+                parts = ks.split(',')
+                if len(parts) >= 7:
+                    result.append({
+                        'date': parts[0],
+                        'open': float(parts[1]),
+                        'close': float(parts[2]),
+                        'high': float(parts[3]),
+                        'low': float(parts[4]),
+                        'volume': float(parts[5]),
+                        'amount': float(parts[6]),
+                    })
+            return result
+    except Exception as e:
+        print(f"[K线] 获取 {code} 失败: {e}")
+        # 降级：生成模拟K线
+        result = []
+        base = random.uniform(10, 200)
+        for i in range(days):
+            o = base + random.uniform(-2, 2)
+            c = o + random.uniform(-3, 3)
+            h = max(o, c) + random.uniform(0, 2)
+            l = min(o, c) - random.uniform(0, 2)
+            result.append({
+                'date': f"2026-{(i//30+1):02d}-{(i%30+1):02d}",
+                'open': round(o, 2), 'close': round(c, 2),
+                'high': round(h, 2), 'low': round(l, 2),
+                'volume': round(random.uniform(1e6, 1e8), 0),
+                'amount': round(random.uniform(1e7, 1e9), 0),
+            })
+            base = c
+        return result
+
+def gen_sentiment_data():
+    """生成情绪面板数据（实时指数 + 模拟板块数据）"""
+    # 1. 尝试获取真实指数数据
+    indices = fetch_eastmoney_indices()
+    if not indices:
+        # 降级：模拟数据
+        indices = [
+            {'name': '上证指数', 'price': round(3250 + random.uniform(-50, 50), 2), 'change': round(random.uniform(-2, 2), 2)},
+            {'name': '深证成指', 'price': round(10200 + random.uniform(-200, 200), 2), 'change': round(random.uniform(-2.5, 2.5), 2)},
+            {'name': '沪深300', 'price': round(3800 + random.uniform(-60, 60), 2), 'change': round(random.uniform(-2, 2), 2)},
+        ]
+
+    # 2. 市场宽度（模拟）
+    up_count = random.randint(800, 3500)
+    down_count = random.randint(800, 3500)
+    flat_count = random.randint(50, 200)
+    total = up_count + down_count + flat_count
+    breadth = {
+        'up': up_count,
+        'down': down_count,
+        'flat': flat_count,
+        'total': total,
+        'ratio': round(up_count / total * 100, 1),
+        'limit_up': random.randint(10, 80),
+        'limit_down': random.randint(0, 20),
+    }
+
+    # 3. 题材涨停排名
+    sectors = []
+    chosen = random.sample(SECTOR_NAMES, min(10, len(SECTOR_NAMES)))
+    for i, name in enumerate(chosen):
+        sectors.append({
+            'name': name,
+            'limit_up_count': random.randint(1, 15) if i < 5 else random.randint(0, 5),
+            'change': round(random.uniform(-3, 8), 2),
+            'amount': round(random.uniform(50, 800), 1),
+        })
+    sectors.sort(key=lambda x: x['limit_up_count'], reverse=True)
+
+    # 4. 近7日板块热力
+    history = []
+    today = datetime.now()
+    for day_offset in range(6, -1, -1):
+        day_sectors = []
+        for name in random.sample(SECTOR_NAMES, 8):
+            day_sectors.append({
+                'name': name,
+                'change': round(random.uniform(-5, 8), 2),
+            })
+        day_sectors.sort(key=lambda x: x['change'], reverse=True)
+        history.append({
+            'date': f"{today.month}-{today.day - day_offset}",
+            'sectors': day_sectors[:5],
+        })
+
+    # 5. 上证K线（模拟20日）
+    sh_klines = []
+    base = 3200
+    for i in range(20):
+        o = base + random.uniform(-10, 10)
+        c = o + random.uniform(-30, 30)
+        h = max(o, c) + random.uniform(0, 15)
+        l = min(o, c) - random.uniform(0, 15)
+        sh_klines.append({'open': round(o,2), 'close': round(c,2), 'high': round(h,2), 'low': round(l,2)})
+        base = c
+
+    return {
+        'indices': indices,
+        'breadth': breadth,
+        'sectors': sectors,
+        'history': history,
+        'sh_klines': sh_klines,
+    }
+
+
 def gen_alert(offset):
     code, name, concepts = random.choice(STOCKS)
     tmpl = random.choice(ALERT_TEMPLATES)
@@ -143,6 +320,25 @@ async def ws_handler(websocket):
                 await websocket.send(json.dumps({
                     'type': 'init', 'alerts': demo_alerts[:50], 'market': 'open'
                 }))
+            elif data.get('action') == 'get_klines':
+                code = data.get('code', '')
+                days = min(int(data.get('days', 60)), 150)
+                klines = fetch_stock_klines(code, days)
+                await websocket.send(json.dumps({
+                    'type': 'klines',
+                    'data': klines
+                }))
+                print(f"[K线] {code} {days}日 → {len(klines)}条")
+            elif data.get('action') == 'get_sentiment':
+                # 获取情绪数据并返回
+                sentiment = gen_sentiment_data()
+                await websocket.send(json.dumps({
+                    'type': 'sentiment',
+                    'data': sentiment
+                }))
+                print(f"[情绪] 推送情绪数据")
+            elif data.get('action') == 'update_schemes':
+                pass  # 演示模式忽略方案更新
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -164,7 +360,6 @@ async def feed_loop():
             feed_index += 1
         else:
             alert = gen_alert(random.randint(0, 1800))
-        from datetime import datetime
         now = datetime.now()
         alert['time'] = now.strftime('%H:%M:%S')
         alert['timestamp'] = int(time.time() * 1000)
