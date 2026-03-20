@@ -857,7 +857,12 @@ async def ws_handler(websocket):
                 elif data.get('action') == 'get_klines':
                     code = data.get('code', '')
                     days = min(int(data.get('days', 60)), 150)
-                    klines = fetch_stock_klines(code, days)
+                    # 优先从缓存取，缓存没有再从通达信取
+                    klines = klines_cache.get(code, [])
+                    if klines:
+                        klines = klines[-days:]
+                    else:
+                        klines = fetch_stock_klines(code, days)
                     await websocket.send(json.dumps({
                         'type': 'klines',
                         'data': klines
@@ -967,21 +972,25 @@ async def main():
     # 启动时优先从本地JSON文件加载K线（毫秒级启动）
     print("[启动] 尝试从本地文件加载K线缓存...")
     loaded = load_klines_from_file()
-    if not loaded:
-        # 本地没有数据，从通达信下载150日K线
-        print("[启动] 本地无缓存，从通达信下载150日K线...")
-        preload_all_klines(150)
+    if loaded:
+        print(f"[启动] 本地缓存已加载，{len(klines_cache)} 只股票可用")
     else:
-        # 本地有数据，后台异步补充最新数据（不阻塞启动）
-        print("[启动] 本地缓存已加载，后台补充最新K线数据...")
-        # 在后台更新：从通达信获取最新数据并合并
+        print("[启动] 本地无缓存，尝试从通达信下载...")
+        try:
+            preload_all_klines(150)
+        except Exception as e:
+            print(f"[启动] 通达信下载失败（可能网络不通）: {e}")
+
+    # 后台尝试补充最新数据（不阻塞WS服务）
+    async def background_update():
+        await asyncio.sleep(5)  # 等5秒再尝试
         try:
             client = get_tdx()
             if client:
                 updated_count = 0
                 for code, name in STOCKS:
                     try:
-                        df = client.bars(symbol=code, frequency=9, offset=5)  # 只取最近5天补充
+                        df = client.bars(symbol=code, frequency=9, offset=5)
                         if df is not None and not df.empty:
                             existing = klines_cache.get(code, [])
                             existing_dates = {k['date'] for k in existing}
@@ -998,16 +1007,20 @@ async def main():
                                         'amount': float(row.get('amount', 0)),
                                     })
                             existing.sort(key=lambda k: k['date'])
-                            klines_cache[code] = existing[-150:]  # 保持150天
+                            klines_cache[code] = existing[-150:]
                             updated_count += 1
                     except Exception as e:
-                        print(f"[补充] {code} 失败: {e}")
-                print(f"[补充] 完成，补充了 {updated_count} 只股票的最新K线")
-                trim_klines_to_150()
-                save_klines_to_file()
+                        pass
+                if updated_count:
+                    print(f"[补充] 完成，补充了 {updated_count} 只股票的最新K线")
+                    trim_klines_to_150()
+                    save_klines_to_file()
+            else:
+                print("[补充] 通达信不可用，使用本地缓存数据")
         except Exception as e:
             print(f"[补充] 补充K线失败: {e}")
 
+    asyncio.create_task(background_update())
     await scan_loop()
 
 if __name__ == '__main__':
