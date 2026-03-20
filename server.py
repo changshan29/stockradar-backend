@@ -969,8 +969,19 @@ async def scan_loop():
 
         await asyncio.sleep(3)
 
+async def health_check(path, request_headers):
+    """处理 HTTP 健康检查请求，让 Railway edge proxy 知道服务在运行"""
+    if path == "/health" or path == "/":
+        return (200, [("Content-Type", "text/plain")], b"StockRadar OK\n")
+    return None  # 其他路径走 WebSocket
+
 async def main():
-    server = await websockets.serve(ws_handler, "0.0.0.0", WS_PORT)
+    server = await websockets.serve(
+        ws_handler, "0.0.0.0", WS_PORT,
+        process_request=health_check,
+        ping_interval=20,
+        ping_timeout=20,
+    )
     print(f"[StockRadar] ws://0.0.0.0:{WS_PORT} (mootdx 真实行情)")
 
     # 启动时优先从本地JSON文件加载K线（毫秒级，不阻塞）
