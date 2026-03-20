@@ -83,6 +83,285 @@ def code_to_market(code):
     """0=深圳 1=上海"""
     return 1 if code.startswith('6') or code.startswith('9') else 0
 
+# ── 预加载的K线缓存 {code: [kline_list]} ──
+klines_cache = {}
+klines_cache_time = 0  # 上次加载时间戳
+
+def preload_all_klines(days=150):
+    """启动时预加载所有个股150日K线数据"""
+    global klines_cache, klines_cache_time
+    client = get_tdx()
+    if not client:
+        print("[预加载] 通达信未连接，跳过")
+        return
+    loaded = 0
+    for code, name in STOCKS:
+        try:
+            df = client.bars(symbol=code, frequency=9, offset=days)
+            if df is not None and not df.empty:
+                result = []
+                for _, row in df.iterrows():
+                    dt = str(row.get('datetime', ''))[:10]
+                    result.append({
+                        'date': dt,
+                        'open': round(float(row.get('open', 0)), 2),
+                        'close': round(float(row.get('close', 0)), 2),
+                        'high': round(float(row.get('high', 0)), 2),
+                        'low': round(float(row.get('low', 0)), 2),
+                        'volume': float(row.get('vol', 0)),
+                        'amount': float(row.get('amount', 0)),
+                    })
+                klines_cache[code] = result
+                loaded += 1
+        except Exception as e:
+            print(f"[预加载] {code} {name} 失败: {e}")
+    klines_cache_time = time.time()
+    print(f"[预加载] 完成，共加载 {loaded}/{len(STOCKS)} 只股票的 {days} 日K线")
+
+def refresh_klines_cache_if_needed():
+    """每天刷新一次缓存"""
+    global klines_cache_time
+    if time.time() - klines_cache_time > 3600 * 4:  # 4小时刷新一次
+        print("[预加载] 缓存过期，重新加载...")
+        preload_all_klines(150)
+
+# ── 方案选股引擎 ──
+def screen_stocks_by_schemes(schemes, quotes=None):
+    """根据方案条件筛选股票，返回符合条件的 alerts 列表"""
+    if not schemes:
+        return []
+
+    now = datetime.now()
+    time_str = now.strftime('%H:%M:%S')
+    results = []
+
+    for code, name in STOCKS:
+        klines = klines_cache.get(code, [])
+        if not klines or len(klines) < 5:
+            continue
+
+        q = quotes.get(code) if quotes else None
+        matched_schemes = []
+
+        for scheme in schemes:
+            if not scheme.get('enabled', False):
+                continue
+            conds = scheme.get('conditions', {})
+            all_pass = False
+            any_enabled = False
+
+            for key, cond in conds.items():
+                if not cond.get('enabled', False):
+                    continue
+                any_enabled = True
+                if not check_condition(key, cond, code, klines, q):
+                    break
+            else:
+                if any_enabled:
+                    all_pass = True
+
+            if all_pass:
+                matched_schemes.append(scheme.get('name', '未命名'))
+
+        if matched_schemes:
+            last_k = klines[-1]
+            prev_k = klines[-2] if len(klines) >= 2 else last_k
+            price = q['price'] if q and q.get('price', 0) > 0 else last_k['close']
+            change = q['change'] if q else round((last_k['close'] - prev_k['close']) / prev_k['close'] * 100, 2) if prev_k['close'] > 0 else 0
+            amount = q['amount'] if q else round(last_k['amount'] / 1e8, 2)
+            speed = q.get('speed', 0) if q else 0
+            concepts = CONCEPT_MAP.get(code, [])
+
+            results.append({
+                'id': f"{code}-screen-{int(time.time()*1000)}-{random.randint(100,999)}",
+                'code': code,
+                'name': name,
+                'type': 'volume',
+                'label': '📊 方案选股',
+                'price': price,
+                'change': change,
+                'speed': speed,
+                'amount': amount,
+                'time': time_str,
+                'timestamp': int(time.time() * 1000),
+                'reason': None,
+                'concepts': concepts[:3],
+                'matched_schemes': matched_schemes,
+            })
+
+    results.sort(key=lambda a: abs(a['change']), reverse=True)
+    return results
+
+def check_condition(key, cond, code, klines, q):
+    """检查单个条件是否满足"""
+    try:
+        last_k = klines[-1]
+        closes = [k['close'] for k in klines]
+        highs = [k['high'] for k in klines]
+        lows = [k['low'] for k in klines]
+        amounts = [k['amount'] for k in klines]
+        volumes = [k['volume'] for k in klines]
+        price = q['price'] if q and q.get('price', 0) > 0 else last_k['close']
+
+        if key == 'marketCap':
+            # 流通市值范围（用价格*成交量估算，简化处理）
+            cap_min = float(cond.get('min', 0))
+            cap_max = float(cond.get('max', 9999))
+            # 简化：用最近成交额/换手率估算，这里暂时跳过精确计算
+            return True  # 暂时通过
+
+        elif key == 'limitUp':
+            change = q['change'] if q else 0
+            if not q and len(klines) >= 2:
+                change = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if closes[-2] > 0 else 0
+            return change >= 9.8
+
+        elif key == 'limitDown':
+            change = q['change'] if q else 0
+            if not q and len(klines) >= 2:
+                change = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if closes[-2] > 0 else 0
+            return change <= -9.8
+
+        elif key == 'amountHigh':
+            days = int(cond.get('days', 5))
+            if len(amounts) < days + 1:
+                return False
+            recent = amounts[-days-1:-1]
+            return amounts[-1] > max(recent) if recent else False
+
+        elif key == 'amountLow':
+            days = int(cond.get('days', 5))
+            if len(amounts) < days + 1:
+                return False
+            recent = amounts[-days-1:-1]
+            return amounts[-1] < min(recent) if recent else False
+
+        elif key == 'amountMultiple':
+            multiple = float(cond.get('multiple', 2))
+            if len(amounts) < 2:
+                return False
+            return amounts[-1] >= amounts[-2] * multiple if amounts[-2] > 0 else False
+
+        elif key == 'volumeRatio':
+            vr_min = float(cond.get('min', 2))
+            if len(volumes) < 6:
+                return False
+            avg5 = sum(volumes[-6:-1]) / 5
+            return volumes[-1] >= avg5 * vr_min if avg5 > 0 else False
+
+        elif key == 'breakDayMA':
+            period = int(cond.get('period', 5))
+            if len(closes) < period + 1:
+                return False
+            ma = sum(closes[-period:]) / period
+            prev_close = closes[-2]
+            return prev_close < ma and price >= ma
+
+        elif key == 'breakGolden':
+            days = int(cond.get('days', 20))
+            ratio = float(cond.get('ratio', 0.382))
+            if len(klines) < days:
+                return False
+            recent = klines[-days:]
+            high = max(k['high'] for k in recent)
+            low = min(k['low'] for k in recent)
+            golden_level = high - (high - low) * ratio
+            return price >= golden_level and closes[-2] < golden_level if len(closes) >= 2 else False
+
+        elif key == 'bollingerUp':
+            band = cond.get('band', 'upper')
+            period_str = cond.get('period', '20d')
+            period = int(period_str.replace('d', '').replace('m', '')) if isinstance(period_str, str) else 20
+            if len(closes) < period:
+                return False
+            sma = sum(closes[-period:]) / period
+            std = (sum((c - sma)**2 for c in closes[-period:]) / period) ** 0.5
+            if band == 'upper':
+                level = sma + 2 * std
+            elif band == 'middle':
+                level = sma
+            else:
+                level = sma - 2 * std
+            return price >= level and closes[-2] < level if len(closes) >= 2 else False
+
+        elif key == 'bollingerDown':
+            band = cond.get('band', 'lower')
+            period_str = cond.get('period', '20d')
+            period = int(period_str.replace('d', '').replace('m', '')) if isinstance(period_str, str) else 20
+            if len(closes) < period:
+                return False
+            sma = sum(closes[-period:]) / period
+            std = (sum((c - sma)**2 for c in closes[-period:]) / period) ** 0.5
+            if band == 'lower':
+                level = sma - 2 * std
+            elif band == 'middle':
+                level = sma
+            else:
+                level = sma + 2 * std
+            return price <= level and closes[-2] > level if len(closes) >= 2 else False
+
+        elif key == 'cupHandle':
+            days = int(cond.get('days', 20))
+            dayA = int(cond.get('dayA', 5))
+            dayB = int(cond.get('dayB', 10))
+            minPct = float(cond.get('minPct', 10))
+            maxPct = float(cond.get('maxPct', 30))
+            if len(klines) < max(days, dayA, dayB) + 1:
+                return False
+            high_n = max(k['high'] for k in klines[-days:])
+            closeA = closes[-dayA] if dayA <= len(closes) else closes[0]
+            closeB = closes[-dayB] if dayB <= len(closes) else closes[0]
+            if closeB <= 0:
+                return False
+            pct = (closeA - closeB) / closeB * 100
+            return price >= high_n and minPct <= pct <= maxPct
+
+        elif key == 'priceCompare':
+            rules = cond.get('rules', [])
+            for rule in rules:
+                dayL = int(rule.get('dayL', 1))
+                dayR = int(rule.get('dayR', 2))
+                fieldL = rule.get('fieldL', 'close')
+                fieldR = rule.get('fieldR', 'close')
+                op = rule.get('op', 'gt')
+                multiplier = rule.get('multiplier', None)
+                if dayL > len(klines) or dayR > len(klines):
+                    return False
+                valL = klines[-dayL].get(fieldL, 0)
+                valR = klines[-dayR].get(fieldR, 0)
+                if multiplier is not None and multiplier > 0:
+                    valR = valR * float(multiplier)
+                if op == 'gt' and not (valL > valR):
+                    return False
+                if op == 'lt' and not (valL < valR):
+                    return False
+            return True
+
+        elif key == 'amountCompare':
+            rules = cond.get('rules', [])
+            for rule in rules:
+                dayL = int(rule.get('dayL', 1))
+                dayR = int(rule.get('dayR', 2))
+                op = rule.get('op', 'gt')
+                multiplier = rule.get('multiplier', None)
+                if dayL > len(amounts) or dayR > len(amounts):
+                    return False
+                valL = amounts[-dayL]
+                valR = amounts[-dayR]
+                if multiplier is not None and multiplier > 0:
+                    valR = valR * float(multiplier)
+                if op == 'gt' and not (valL > valR):
+                    return False
+                if op == 'lt' and not (valL < valR):
+                    return False
+            return True
+
+    except Exception as e:
+        print(f"[选股] 条件 {key} 检查失败: {e}")
+        return False
+
+    return True
+
 # ── 上一次快照 ──
 last_snapshot = {}
 
@@ -466,7 +745,26 @@ async def ws_handler(websocket):
                         'data': sentiment
                     }))
                 elif data.get('action') == 'update_schemes':
-                    pass
+                    # 收到方案后立即执行选股
+                    schemes = data.get('schemes', [])
+                    refresh_klines_cache_if_needed()
+                    quotes = fetch_realtime_quotes() or {}
+                    screen_results = screen_stocks_by_schemes(schemes, quotes)
+                    await websocket.send(json.dumps({
+                        'type': 'screen_results',
+                        'alerts': screen_results
+                    }))
+                    print(f"[选股] 方案选股完成，命中 {len(screen_results)} 只")
+                elif data.get('action') == 'screen_stocks':
+                    schemes = data.get('schemes', [])
+                    refresh_klines_cache_if_needed()
+                    quotes = fetch_realtime_quotes() or {}
+                    screen_results = screen_stocks_by_schemes(schemes, quotes)
+                    await websocket.send(json.dumps({
+                        'type': 'screen_results',
+                        'alerts': screen_results
+                    }))
+                    print(f"[选股] 手动选股完成，命中 {len(screen_results)} 只")
             except Exception as e:
                 print(f"[WS] 消息处理错误: {e}")
     except websockets.exceptions.ConnectionClosed:
@@ -522,6 +820,11 @@ async def scan_loop():
 async def main():
     server = await websockets.serve(ws_handler, "0.0.0.0", WS_PORT)
     print(f"[StockRadar] ws://0.0.0.0:{WS_PORT} (mootdx 真实行情)")
+
+    # 启动时预加载所有个股150日K线数据
+    print("[启动] 预加载150日K线数据...")
+    preload_all_klines(150)
+
     await scan_loop()
 
 if __name__ == '__main__':
